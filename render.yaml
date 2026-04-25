@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: landscaping-video-server
+    env: node
+    buildCommand: "npm install && apt-get update && apt-get install -y ffmpeg"
+    startCommand: "node server.js"
+    envVars:
+      - key: KLING_ACCESS_KEY
+        sync: false
+      - key: KLING_SECRET_KEY
+        sync: false
+      - key: GOOGLE_DRIVE_COMPLETED_FOLDER
+        value: "1G0Gp7R4_jY3tz01tPIgVesIyhEw-aCcq"

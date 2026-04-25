@@ -6,6 +6,15 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 app.use(express.json({ limit: '50mb' }));
 
 const KLING_ACCESS_KEY = process.env.KLING_ACCESS_KEY;
@@ -75,7 +84,6 @@ app.post('/process', async (req, res) => {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // Step 1 — Submit all photos to Kling
     console.log(`[${job_id}] Submitting ${clips.length} clips to Kling...`);
     const taskIds = [];
     for (const clip of clips) {
@@ -85,7 +93,6 @@ app.post('/process', async (req, res) => {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // Step 2 — Poll all Kling jobs until complete
     console.log(`[${job_id}] Waiting for Kling to finish...`);
     const videoUrls = [];
     for (const taskId of taskIds) {
@@ -94,7 +101,6 @@ app.post('/process', async (req, res) => {
       console.log(`[${job_id}] Clip ready: ${url}`);
     }
 
-    // Step 3 — Download all generated clips
     const clipPaths = [];
     for (let i = 0; i < videoUrls.length; i++) {
       const clipPath = `${workDir}/clip_${i}.mp4`;
@@ -103,15 +109,13 @@ app.post('/process', async (req, res) => {
       console.log(`[${job_id}] Downloaded clip ${i}`);
     }
 
-    // Step 4 — Build FFmpeg concat list
     const concatList = clipPaths.map(p => `file '${p}'`).join('\n');
     const concatFile = `${workDir}/concat.txt`;
     fs.writeFileSync(concatFile, concatList);
 
-    // Step 5 — Run FFmpeg to stitch + add text overlays
     const outputPath = `${workDir}/final_output.mp4`;
     const hook = req.body.hook_text || 'Your backyard deserves this.';
-    const cta = req.body.cta_text || 'Book your free consultation. Link in bio.';
+    const cta = req.body.cta_text || 'Book your free consultation today. Link in bio.';
 
     const ffmpegCmd = [
       'ffmpeg -y',
@@ -134,7 +138,6 @@ app.post('/process', async (req, res) => {
       });
     });
 
-    // Step 6 — Read and return the final video
     const videoData = fs.readFileSync(outputPath);
     const base64Video = videoData.toString('base64');
 

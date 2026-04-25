@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-const jwt = require('jsonwebtoken');
 const { exec } = require('child_process');
 const fs = require('fs');
 
@@ -16,72 +15,61 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '50mb' }));
 
-const KLING_ACCESS_KEY = process.env.KLING_ACCESS_KEY;
-const KLING_SECRET_KEY = process.env.KLING_SECRET_KEY;
-
-function generateKlingToken() {
-  const payload = {
-    iss: KLING_ACCESS_KEY,
-    exp: Math.floor(Date.now() / 1000) + 1800,
-    nbf: Math.floor(Date.now() / 1000) - 5
-  };
-  return jwt.sign(payload, KLING_SECRET_KEY, { algorithm: 'HS256', header: { alg: 'HS256', typ: 'JWT' } });
-}
+const FAL_KEY = process.env.FAL_KEY;
 
 async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function submitKlingJobWithRetry(imageBase64, prompt, retries = 5) {
-  for (let attempt = 0; attempt < retries; attempt++) {
-    try {
-      const token = generateKlingToken();
-      const response = await axios.post(
-        'https://api.klingai.com/v1/videos/image2video',
-        {
-          model_name: 'kling-v1',
-          image: imageBase64,
-          prompt: prompt,
-          duration: '5',
-          mode: 'std',
-          cfg_scale: 0.5
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-      return response.data.data.task_id;
-    } catch (err) {
-      const status = err.response?.status;
-      if (status === 429) {
-        const wait = Math.pow(2, attempt + 2) * 1000 + Math.random() * 1000;
-        console.log(`Rate limited. Waiting ${Math.round(wait/1000)}s before retry ${attempt + 1}/${retries}`);
-        await sleep(wait);
-      } else {
-        throw err;
+async function generateKlingClip(imageBase64, prompt) {
+  console.log('Submitting to fal.ai Kling 3.0...');
+  
+  // Submit the job
+  const submitRes = await axios.post(
+    'https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video',
+    {
+      image_url: `data:image/jpeg;base64,${imageBase64}`,
+      prompt: prompt,
+      duration: '5',
+      aspect_ratio: '1:1'
+    },
+    {
+      headers: {
+        'Authorization': `Key ${FAL_KEY}`,
+        'Content-Type': 'application/json'
       }
     }
-  }
-  throw new Error('Max retries exceeded for Kling submission');
-}
+  );
 
-async function pollKlingJob(taskId) {
+  const requestId = submitRes.data.request_id;
+  console.log(`Job submitted: ${requestId}`);
+
+  // Poll for completion
   for (let i = 0; i < 60; i++) {
     await sleep(10000);
-    const token = generateKlingToken();
-    const response = await axios.get(
-      `https://api.klingai.com/v1/videos/image2video/${taskId}`,
-      { headers: { 'Authorization': `Bearer ${token}` } }
+    const statusRes = await axios.get(
+      `https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}/status`,
+      {
+        headers: { 'Authorization': `Key ${FAL_KEY}` }
+      }
     );
-    const status = response.data.data.task_status;
-    console.log(`Task ${taskId} status: ${status}`);
-    if (status === 'succeed') return response.data.data.task_result.videos[0].url;
-    if (status === 'failed') throw new Error('Kling generation failed');
+    
+    const status = statusRes.data.status;
+    console.log(`Status: ${status}`);
+    
+    if (status === 'COMPLETED') {
+      const resultRes = await axios.get(
+        `https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}`,
+        {
+          headers: { 'Authorization': `Key ${FAL_KEY}` }
+        }
+      );
+      return resultRes.data.video.url;
+    }
+    
+    if (status === 'FAILED') throw new Error('fal.ai generation failed');
   }
-  throw new Error('Kling timed out');
+  throw new Error('fal.ai timed out');
 }
 
 async function downloadFile(url, destPath) {
@@ -99,34 +87,26 @@ app.post('/process', async (req, res) => {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // Submit clips ONE AT A TIME with delay between each
-    console.log(`[${job_id}] Submitting ${clips.length} clips to Kling one at a time...`);
-    const taskIds = [];
+    // Generate all clips with fal.ai one at a time
+    console.log(`[${job_id}] Generating ${clips.length} clips with Kling 3.0...`);
+    const videoUrls = [];
+    
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i];
-      console.log(`[${job_id}] Submitting clip ${i + 1}/${clips.length}: ${clip.label}`);
-      const taskId = await submitKlingJobWithRetry(clip.image_base64, clip.kling_prompt);
-      taskIds.push(taskId);
-      console.log(`[${job_id}] Submitted: ${clip.label} → task ${taskId}`);
-      // Wait 8 seconds between submissions to avoid rate limiting
-      if (i < clips.length - 1) await sleep(8000);
-    }
-
-    // Poll all jobs
-    console.log(`[${job_id}] Waiting for Kling to finish all clips...`);
-    const videoUrls = [];
-    for (const taskId of taskIds) {
-      const url = await pollKlingJob(taskId);
+      console.log(`[${job_id}] Clip ${i + 1}/${clips.length}: ${clip.label}`);
+      const url = await generateKlingClip(clip.image_base64, clip.kling_prompt);
       videoUrls.push(url);
-      console.log(`[${job_id}] Clip ready: ${url}`);
+      console.log(`[${job_id}] Clip ${i + 1} ready: ${url}`);
+      if (i < clips.length - 1) await sleep(3000);
     }
 
-    // Download clips
+    // Download all clips
     const clipPaths = [];
     for (let i = 0; i < videoUrls.length; i++) {
       const clipPath = `${workDir}/clip_${i}.mp4`;
       await downloadFile(videoUrls[i], clipPath);
       clipPaths.push(clipPath);
+      console.log(`[${job_id}] Downloaded clip ${i + 1}`);
     }
 
     // FFmpeg stitch
@@ -143,8 +123,8 @@ app.post('/process', async (req, res) => {
       `-f concat -safe 0 -i "${concatFile}"`,
       `-vf "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,`,
       `drawtext=text='${hook}':fontcolor=white:fontsize=52:x=(w-text_w)/2:y=(h/6):enable='between(t,0,3)':box=1:boxcolor=black@0.45:boxborderw=12,`,
-      `drawtext=text='BEFORE':fontcolor=white:fontsize=44:x=40:y=h-80:enable='between(t,0,${clips.filter(c=>c.type==='before').length * 5})':box=1:boxcolor=black@0.4:boxborderw=10,`,
-      `drawtext=text='AFTER':fontcolor=white:fontsize=44:x=40:y=h-80:enable='between(t,${clips.filter(c=>c.type==='before').length * 5},${clips.length * 5})':box=1:boxcolor=black@0.4:boxborderw=10,`,
+      `drawtext=text='BEFORE':fontcolor=white:fontsize=44:x=40:y=h-80:enable='between(t,0,${clips.filter(c => c.type === 'before').length * 5})':box=1:boxcolor=black@0.4:boxborderw=10,`,
+      `drawtext=text='AFTER':fontcolor=white:fontsize=44:x=40:y=h-80:enable='between(t,${clips.filter(c => c.type === 'before').length * 5},${clips.length * 5})':box=1:boxcolor=black@0.4:boxborderw=10,`,
       `drawtext=text='${cta}':fontcolor=white:fontsize=38:x=(w-text_w)/2:y=h-100:enable='between(t,${(clips.length * 5) - 4},${clips.length * 5})':box=1:boxcolor=black@0.5:boxborderw=12"`,
       `-c:v libx264 -b:v 6000k -preset slow -r 30`,
       `-c:a aac`,

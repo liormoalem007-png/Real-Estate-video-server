@@ -22,11 +22,10 @@ async function sleep(ms) {
 }
 
 async function generateKlingClip(imageBase64, prompt) {
-  console.log('Submitting to fal.ai Kling 3.0...');
-  
-  // Submit the job
+  console.log('Submitting to fal.ai Kling...');
+
   const submitRes = await axios.post(
-    'https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video',
+    'https://fal.run/fal-ai/kling-video/v1/standard/image-to-video',
     {
       image_url: `data:image/jpeg;base64,${imageBase64}`,
       prompt: prompt,
@@ -41,35 +40,45 @@ async function generateKlingClip(imageBase64, prompt) {
     }
   );
 
+  console.log('fal.ai response:', JSON.stringify(submitRes.data));
+
+  // Handle both sync and async responses
+  if (submitRes.data.video && submitRes.data.video.url) {
+    return submitRes.data.video.url;
+  }
+
   const requestId = submitRes.data.request_id;
+  if (!requestId) throw new Error('No request_id or video URL in response: ' + JSON.stringify(submitRes.data));
+
   console.log(`Job submitted: ${requestId}`);
 
-  // Poll for completion
   for (let i = 0; i < 60; i++) {
     await sleep(10000);
+
     const statusRes = await axios.get(
-      `https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}/status`,
+      `https://fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}/status`,
       {
         headers: { 'Authorization': `Key ${FAL_KEY}` }
       }
     );
-    
+
     const status = statusRes.data.status;
     console.log(`Status: ${status}`);
-    
+
     if (status === 'COMPLETED') {
       const resultRes = await axios.get(
-        `https://queue.fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}`,
+        `https://fal.run/fal-ai/kling-video/v1/standard/image-to-video/requests/${requestId}`,
         {
           headers: { 'Authorization': `Key ${FAL_KEY}` }
         }
       );
       return resultRes.data.video.url;
     }
-    
+
     if (status === 'FAILED') throw new Error('fal.ai generation failed');
   }
-  throw new Error('fal.ai timed out');
+
+  throw new Error('fal.ai timed out after 10 minutes');
 }
 
 async function downloadFile(url, destPath) {
@@ -87,10 +96,9 @@ app.post('/process', async (req, res) => {
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    // Generate all clips with fal.ai one at a time
-    console.log(`[${job_id}] Generating ${clips.length} clips with Kling 3.0...`);
+    console.log(`[${job_id}] Generating ${clips.length} clips with fal.ai Kling...`);
     const videoUrls = [];
-    
+
     for (let i = 0; i < clips.length; i++) {
       const clip = clips[i];
       console.log(`[${job_id}] Clip ${i + 1}/${clips.length}: ${clip.label}`);
@@ -100,7 +108,6 @@ app.post('/process', async (req, res) => {
       if (i < clips.length - 1) await sleep(3000);
     }
 
-    // Download all clips
     const clipPaths = [];
     for (let i = 0; i < videoUrls.length; i++) {
       const clipPath = `${workDir}/clip_${i}.mp4`;
@@ -109,7 +116,6 @@ app.post('/process', async (req, res) => {
       console.log(`[${job_id}] Downloaded clip ${i + 1}`);
     }
 
-    // FFmpeg stitch
     const concatList = clipPaths.map(p => `file '${p}'`).join('\n');
     const concatFile = `${workDir}/concat.txt`;
     fs.writeFileSync(concatFile, concatList);
